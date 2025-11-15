@@ -29,6 +29,7 @@ export interface IStorage {
   getPriceListRow(id: string): Promise<PriceListRow | undefined>;
   getPriceListRowsBySupplierId(supplierId: string): Promise<PriceListRow[]>;
   createPriceListRow(row: InsertPriceListRow): Promise<PriceListRow>;
+  updatePriceListRow(id: string, row: InsertPriceListRow): Promise<PriceListRow>;
   deletePriceListRow(id: string): Promise<void>;
 
   getPurchaseOrders(): Promise<PurchaseOrder[]>;
@@ -85,6 +86,15 @@ export class DatabaseStorage implements IStorage {
 
   async createPriceListRow(insertRow: InsertPriceListRow): Promise<PriceListRow> {
     const [row] = await db.insert(priceListRows).values(insertRow).returning();
+    return row;
+  }
+
+  async updatePriceListRow(id: string, updateRow: InsertPriceListRow): Promise<PriceListRow> {
+    const [row] = await db
+      .update(priceListRows)
+      .set(updateRow)
+      .where(eq(priceListRows.id, id))
+      .returning();
     return row;
   }
 

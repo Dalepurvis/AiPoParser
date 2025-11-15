@@ -1,5 +1,5 @@
 import { useState, useMemo } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
@@ -10,16 +10,33 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Loader2, Sparkles, AlertCircle, CheckCircle2, Edit2, Save, X, HelpCircle } from "lucide-react";
+import { Loader2, Sparkles, AlertCircle, CheckCircle2, Edit2, Save, X, HelpCircle, PlusCircle } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
-import { useLocation } from "wouter";
-import { userRequestFormSchema, type AIParserResponse, type DraftPOItem } from "@shared/schema";
+import { Link, useLocation } from "wouter";
+import {
+  userRequestFormSchema,
+  insertPriceListRowSchema,
+  type AIParserResponse,
+  type DraftPOItem,
+  type PriceListRow,
+  type Supplier,
+  type InsertPriceListRow,
+  type AIQuestion,
+} from "@shared/schema";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Separator } from "@/components/ui/separator";
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { z } from "zod";
 
 const examplePrompts = [
@@ -33,9 +50,23 @@ type UserRequestForm = z.infer<typeof userRequestFormSchema>;
 export default function CreatePO() {
   const [aiResponse, setAiResponse] = useState<AIParserResponse | null>(null);
   const [editingItems, setEditingItems] = useState<Record<number, DraftPOItem>>({});
-  const [clarificationAnswers, setClarificationAnswers] = useState<Record<string, string | number>>({});
+  const [clarificationAnswers, setClarificationAnswers] = useState<Record<string, string | number | boolean>>({});
+  const [isCreateProductOpen, setIsCreateProductOpen] = useState(false);
+  const [activeQuestionDetails, setActiveQuestionDetails] = useState<{
+    id: string;
+    type: ReturnType<typeof detectQuestionType>;
+    relatedItemIndexes: number[];
+  } | null>(null);
   const { toast } = useToast();
   const [, navigate] = useLocation();
+
+  const { data: priceListRows } = useQuery<PriceListRow[]>({
+    queryKey: ["/api/price-lists"],
+  });
+
+  const { data: suppliers } = useQuery<Supplier[]>({
+    queryKey: ["/api/suppliers"],
+  });
   
   const form = useForm<UserRequestForm>({
     resolver: zodResolver(userRequestFormSchema),
@@ -43,6 +74,28 @@ export default function CreatePO() {
       userRequest: "",
     },
   });
+
+  const newProductForm = useForm<InsertPriceListRow>({
+    resolver: zodResolver(insertPriceListRowSchema),
+    defaultValues: {
+      supplierId: "",
+      sku: "",
+      productName: "",
+      unitType: "unit",
+      minQty: 1,
+      maxQty: null,
+      unitPrice: 0,
+      currency: "GBP",
+      notes: "",
+    },
+  });
+
+  const isPriceListEmpty = priceListRows !== undefined && priceListRows.length === 0;
+
+  const supplierForDraft = useMemo(() => {
+    if (!aiResponse || !suppliers) return null;
+    return suppliers.find((supplier) => supplier.name === aiResponse.draft_po.supplier_name) ?? null;
+  }, [aiResponse, suppliers]);
 
   const generateDraftMutation = useMutation({
     mutationFn: async (request: string) => {
@@ -128,18 +181,145 @@ export default function CreatePO() {
     },
   });
 
+  const createProductMutation = useMutation({
+    mutationFn: async (data: InsertPriceListRow) => {
+      const response = await apiRequest("POST", "/api/price-lists", data);
+      return await response.json() as PriceListRow;
+    },
+    onSuccess: (_row, variables) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/price-lists"] });
+      toast({
+        title: "Product Saved",
+        description: `${variables.productName} has been added to the price list.`,
+      });
+
+      if (activeQuestionDetails) {
+        const isPriceQuestion = activeQuestionDetails.type === "price";
+        handleClarificationAnswer(activeQuestionDetails.id, isPriceQuestion ? variables.unitPrice : variables.sku);
+
+        const relatedIndexes = activeQuestionDetails.relatedItemIndexes;
+
+        setAiResponse((previous) => {
+          if (!previous) return previous;
+          const updatedItems = previous.draft_po.items.map((item, idx) => {
+            if (!relatedIndexes.includes(idx)) return item;
+            const quantity = item.quantity;
+            const newLineTotal = quantity && variables.unitPrice
+              ? Number((quantity * variables.unitPrice).toFixed(2))
+              : item.line_total;
+            const filteredUncertain = item.ai_uncertain_fields.filter(
+              (field) => !["sku", "unit_price", "price"].includes(field),
+            );
+            const updatedCurrency = variables.currency ?? item.currency;
+            return {
+              ...item,
+              sku: variables.sku,
+              product_name: variables.productName || item.product_name,
+              unit_type: variables.unitType,
+              unit_price: variables.unitPrice,
+              currency: updatedCurrency,
+              line_total: newLineTotal,
+              price_source: "Manual price list entry",
+              ai_confidence: Math.max(item.ai_confidence, 0.95),
+              ai_uncertain_fields: filteredUncertain,
+            };
+          });
+
+          return {
+            ...previous,
+            draft_po: {
+              ...previous.draft_po,
+              items: updatedItems,
+            },
+          };
+        });
+
+        setEditingItems((prev) => {
+          const next = { ...prev };
+          relatedIndexes.forEach((idx) => {
+            if (!next[idx]) return;
+            const quantity = next[idx].quantity;
+            const newLineTotal = quantity && variables.unitPrice
+              ? Number((quantity * variables.unitPrice).toFixed(2))
+              : next[idx].line_total;
+            const filteredUncertain = next[idx].ai_uncertain_fields.filter(
+              (field) => !["sku", "unit_price", "price"].includes(field),
+            );
+            const updatedCurrency = variables.currency ?? next[idx].currency;
+            next[idx] = {
+              ...next[idx],
+              sku: variables.sku,
+              product_name: variables.productName || next[idx].product_name,
+              unit_type: variables.unitType,
+              unit_price: variables.unitPrice,
+              currency: updatedCurrency,
+              line_total: newLineTotal,
+              price_source: "Manual price list entry",
+              ai_confidence: Math.max(next[idx].ai_confidence, 0.95),
+              ai_uncertain_fields: filteredUncertain,
+            };
+          });
+          return next;
+        });
+
+        if (aiResponse) {
+          setClarificationAnswers((prev) => {
+            const updates = { ...prev };
+            aiResponse.questions_for_user.forEach((question) => {
+              if (!question.related_item_indexes.some((index) => relatedIndexes.includes(index))) {
+                return;
+              }
+              const type = detectQuestionType(question.question);
+              if (type === "price" && updates[question.id] === undefined) {
+                updates[question.id] = variables.unitPrice;
+              }
+              if ((type === "sku" || type === "selection") && updates[question.id] === undefined) {
+                updates[question.id] = variables.sku;
+              }
+            });
+            return updates;
+          });
+        }
+      }
+
+      setIsCreateProductOpen(false);
+      setActiveQuestionDetails(null);
+      newProductForm.reset();
+    },
+    onError: () => {
+      toast({
+        title: "Error",
+        description: "Failed to save the product. Please try again.",
+        variant: "destructive",
+      });
+    },
+  });
+
   const onSubmit = (data: UserRequestForm) => {
     generateDraftMutation.mutate(data.userRequest);
   };
 
   const handleSavePO = () => {
     if (!aiResponse) return;
-    
+    if (!canSaveDraft) {
+      toast({
+        title: "Complete Required Fields",
+        description: "Each item needs a supplier, SKU, quantity, and unit price before saving.",
+        variant: "destructive",
+      });
+      return;
+    }
+
     const updatedResponse = { ...aiResponse };
-    Object.entries(editingItems).forEach(([index, item]) => {
-      updatedResponse.draft_po.items[Number(index)] = item;
+    updatedResponse.draft_po.items = updatedResponse.draft_po.items.map((item, index) => {
+      const edited = editingItems[index] ?? item;
+      if (edited.unit_price !== null) {
+        const recalculatedTotal = Number((edited.unit_price * edited.quantity).toFixed(2));
+        return { ...edited, line_total: recalculatedTotal };
+      }
+      return { ...edited };
     });
-    
+
     savePOMutation.mutate({ draft: updatedResponse, userRequest: form.getValues("userRequest") });
   };
 
@@ -174,10 +354,23 @@ export default function CreatePO() {
     return "text-red-600 dark:text-red-400";
   };
 
-  const handleClarificationAnswer = (questionId: string, value: string | number) => {
-    setClarificationAnswers({
-      ...clarificationAnswers,
-      [questionId]: value,
+  const handleClarificationAnswer = (
+    questionId: string,
+    value: string | number | boolean | null,
+  ) => {
+    setClarificationAnswers((prev) => {
+      if (
+        value === null ||
+        value === "" ||
+        (typeof value === "number" && Number.isNaN(value))
+      ) {
+        const { [questionId]: _removed, ...rest } = prev;
+        return rest;
+      }
+      return {
+        ...prev,
+        [questionId]: value,
+      };
     });
   };
 
@@ -190,10 +383,71 @@ export default function CreatePO() {
     return "text";
   };
 
+  const openCreateProductDialog = (
+    question: AIQuestion,
+    questionType: ReturnType<typeof detectQuestionType>,
+  ) => {
+    if (!suppliers || suppliers.length === 0) {
+      toast({
+        title: "Add a Supplier First",
+        description: "You need at least one supplier before creating a price list entry.",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const matchedSupplier = supplierForDraft ?? suppliers[0];
+    const firstIndex = question.related_item_indexes[0];
+    const baseItem =
+      firstIndex !== undefined
+        ? editingItems[firstIndex] ?? aiResponse?.draft_po.items[firstIndex]
+        : undefined;
+
+    newProductForm.reset({
+      supplierId: matchedSupplier?.id ?? "",
+      sku: baseItem?.sku ?? "",
+      productName: baseItem?.product_name ?? "",
+      unitType: baseItem?.unit_type ?? "unit",
+      minQty: 1,
+      maxQty: null,
+      unitPrice: baseItem?.unit_price ?? 0,
+      currency: baseItem?.currency ?? "GBP",
+      notes: baseItem?.notes ?? "",
+    });
+
+    setActiveQuestionDetails({
+      id: question.id,
+      type: questionType,
+      relatedItemIndexes: question.related_item_indexes,
+    });
+    setIsCreateProductOpen(true);
+  };
+
+  const handleCreateProductSubmit = (data: InsertPriceListRow) => {
+    createProductMutation.mutate(data);
+  };
+
+  const currentItems = useMemo(() => {
+    if (!aiResponse) return [] as DraftPOItem[];
+    return aiResponse.draft_po.items.map((item, index) => editingItems[index] ?? item);
+  }, [aiResponse, editingItems]);
+
+  const canSaveDraft = useMemo(() => {
+    if (!aiResponse) return false;
+    if (!aiResponse.draft_po.supplier_name) return false;
+    if (currentItems.length === 0) return false;
+    return currentItems.every((item) =>
+      Boolean(item.sku && item.sku.trim().length > 0) &&
+      item.quantity > 0 &&
+      item.unit_price !== null &&
+      item.unit_price > 0
+    );
+  }, [aiResponse, currentItems]);
+
   const allQuestionsAnswered = useMemo(() => {
     if (!aiResponse || aiResponse.questions_for_user.length === 0) return true;
-    return aiResponse.questions_for_user.every(q => 
-      clarificationAnswers[q.id] !== undefined && clarificationAnswers[q.id] !== ''
+    return aiResponse.questions_for_user.every((q) =>
+      clarificationAnswers[q.id] !== undefined && clarificationAnswers[q.id] !== ""
     );
   }, [aiResponse, clarificationAnswers]);
 
@@ -210,13 +464,28 @@ export default function CreatePO() {
   };
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-3xl font-semibold" data-testid="text-create-po-title">Create Purchase Order</h1>
+    <>
+      <div className="space-y-6">
+        <div>
+          <h1 className="text-3xl font-semibold" data-testid="text-create-po-title">Create Purchase Order</h1>
         <p className="text-sm text-muted-foreground mt-1">
           Describe what you need in natural language, and AI will draft your purchase order
         </p>
       </div>
+
+      {isPriceListEmpty && (
+        <Alert className="border-amber-300 bg-amber-50 dark:border-amber-900 dark:bg-amber-950/20" data-testid="alert-empty-price-list">
+          <AlertCircle className="h-4 w-4" />
+          <AlertDescription className="flex flex-col gap-2 text-sm md:flex-row md:items-center md:justify-between">
+            <span>
+              No price list entries found. Add products and pricing so the AI can match SKUs automatically.
+            </span>
+            <Button asChild size="sm" variant="outline" data-testid="button-go-to-price-lists">
+              <Link href="/price-lists">Manage Price Lists</Link>
+            </Button>
+          </AlertDescription>
+        </Alert>
+      )}
 
       <Card>
         <CardHeader>
@@ -545,7 +814,8 @@ export default function CreatePO() {
                 {aiResponse.questions_for_user.map((question, i) => {
                   const questionType = detectQuestionType(question.question);
                   const hasOptions = question.suggested_options.length > 0;
-                  
+                  const answerValue = clarificationAnswers[question.id];
+
                   return (
                     <Card key={question.id} className="bg-background" data-testid={`card-question-${i}`}>
                       <CardContent className="pt-6">
@@ -562,7 +832,7 @@ export default function CreatePO() {
                           {hasOptions ? (
                             question.suggested_options.length > 3 ? (
                               <Select
-                                value={clarificationAnswers[question.id]?.toString() || ""}
+                                value={answerValue !== undefined ? String(answerValue) : ""}
                                 onValueChange={(value) => handleClarificationAnswer(question.id, value)}
                               >
                                 <SelectTrigger data-testid={`select-question-${i}`}>
@@ -578,7 +848,7 @@ export default function CreatePO() {
                               </Select>
                             ) : (
                               <RadioGroup
-                                value={clarificationAnswers[question.id]?.toString() || ""}
+                                value={answerValue !== undefined ? String(answerValue) : ""}
                                 onValueChange={(value) => handleClarificationAnswer(question.id, value)}
                                 data-testid={`radiogroup-question-${i}`}
                               >
@@ -601,10 +871,23 @@ export default function CreatePO() {
                               <Input
                                 type="number"
                                 step={questionType === "price" ? "0.01" : "1"}
-                                min="0"
+                                min={questionType === "quantity" ? 1 : 0}
                                 placeholder={questionType === "price" ? "Enter price (e.g., 12.99)" : "Enter quantity"}
-                                value={clarificationAnswers[question.id] || ""}
-                                onChange={(e) => handleClarificationAnswer(question.id, parseFloat(e.target.value) || 0)}
+                                value={answerValue !== undefined ? String(answerValue) : ""}
+                                onChange={(e) => {
+                                  const rawValue = e.target.value;
+                                  if (rawValue === "") {
+                                    handleClarificationAnswer(question.id, null);
+                                    return;
+                                  }
+                                  const parsed = questionType === "price"
+                                    ? parseFloat(rawValue)
+                                    : parseInt(rawValue, 10);
+                                  handleClarificationAnswer(
+                                    question.id,
+                                    Number.isNaN(parsed) ? null : parsed,
+                                  );
+                                }}
                                 data-testid={`input-question-${i}`}
                               />
                               {questionType === "price" && (
@@ -617,10 +900,28 @@ export default function CreatePO() {
                             <Input
                               type="text"
                               placeholder={questionType === "sku" ? "Enter SKU/Product Code" : "Enter your answer"}
-                              value={clarificationAnswers[question.id] || ""}
+                              value={typeof answerValue === "string" ? answerValue : answerValue !== undefined ? String(answerValue) : ""}
                               onChange={(e) => handleClarificationAnswer(question.id, e.target.value)}
                               data-testid={`input-question-${i}`}
                             />
+                          )}
+
+                          {(questionType === "sku" || questionType === "price") && (
+                            <div className="flex flex-col gap-2 pt-2 sm:flex-row sm:items-center sm:justify-between">
+                              <p className="text-xs text-muted-foreground">
+                                Missing product details? Create a price list entry to answer automatically.
+                              </p>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => openCreateProductDialog(question, questionType)}
+                                data-testid={`button-create-product-${i}`}
+                              >
+                                <PlusCircle className="w-4 h-4 mr-2" />
+                                Create New Product
+                              </Button>
+                            </div>
                           )}
                         </div>
                       </CardContent>
@@ -739,7 +1040,7 @@ export default function CreatePO() {
             </Button>
             <Button
               onClick={handleSavePO}
-              disabled={savePOMutation.isPending}
+              disabled={savePOMutation.isPending || !canSaveDraft}
               data-testid="button-save-po"
             >
               {savePOMutation.isPending ? (
@@ -754,6 +1055,237 @@ export default function CreatePO() {
           </div>
         </div>
       )}
-    </div>
+      </div>
+
+      <Dialog
+        open={isCreateProductOpen}
+        onOpenChange={(open) => {
+          setIsCreateProductOpen(open);
+          if (!open) {
+            setActiveQuestionDetails(null);
+            newProductForm.reset();
+          }
+        }}
+      >
+        <DialogContent className="max-w-xl" data-testid="dialog-create-product">
+          <DialogHeader>
+            <DialogTitle data-testid="text-create-product-title">Create New Product</DialogTitle>
+            <DialogDescription data-testid="text-create-product-description">
+              Save the product to your price list so the AI can reuse it in future drafts.
+            </DialogDescription>
+          </DialogHeader>
+
+          <Form {...newProductForm}>
+            <form onSubmit={newProductForm.handleSubmit(handleCreateProductSubmit)} className="space-y-4">
+              <FormField
+                control={newProductForm.control}
+                name="supplierId"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Supplier *</FormLabel>
+                    <Select onValueChange={field.onChange} value={field.value}>
+                      <FormControl>
+                        <SelectTrigger data-testid="select-product-supplier">
+                          <SelectValue placeholder="Select a supplier" />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent>
+                        {suppliers?.map((supplier) => (
+                          <SelectItem key={supplier.id} value={supplier.id}>
+                            {supplier.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <div className="grid gap-4 md:grid-cols-2">
+                <FormField
+                  control={newProductForm.control}
+                  name="sku"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>SKU *</FormLabel>
+                      <FormControl>
+                        <Input placeholder="Enter SKU" {...field} data-testid="input-product-sku" />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={newProductForm.control}
+                  name="productName"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Product Name *</FormLabel>
+                      <FormControl>
+                        <Input placeholder="Enter product name" {...field} data-testid="input-product-name" />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-3">
+                <FormField
+                  control={newProductForm.control}
+                  name="unitType"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Unit Type *</FormLabel>
+                      <Select onValueChange={field.onChange} value={field.value}>
+                        <FormControl>
+                          <SelectTrigger data-testid="select-product-unit-type">
+                            <SelectValue placeholder="Select" />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
+                          <SelectItem value="unit">Unit</SelectItem>
+                          <SelectItem value="box">Box</SelectItem>
+                          <SelectItem value="pallet">Pallet</SelectItem>
+                          <SelectItem value="m2">m²</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={newProductForm.control}
+                  name="minQty"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Min Qty</FormLabel>
+                      <FormControl>
+                        <Input
+                          type="number"
+                          value={field.value ?? ""}
+                          onChange={(e) => field.onChange(e.target.value ? parseInt(e.target.value, 10) : null)}
+                          data-testid="input-product-min-qty"
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={newProductForm.control}
+                  name="maxQty"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Max Qty</FormLabel>
+                      <FormControl>
+                        <Input
+                          type="number"
+                          value={field.value ?? ""}
+                          onChange={(e) => field.onChange(e.target.value ? parseInt(e.target.value, 10) : null)}
+                          data-testid="input-product-max-qty"
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-3">
+                <FormField
+                  control={newProductForm.control}
+                  name="unitPrice"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Unit Price *</FormLabel>
+                      <FormControl>
+                        <Input
+                          type="number"
+                          step="0.01"
+                          value={field.value ?? 0}
+                          onChange={(e) => field.onChange(parseFloat(e.target.value) || 0)}
+                          data-testid="input-product-unit-price"
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={newProductForm.control}
+                  name="currency"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Currency *</FormLabel>
+                      <Select onValueChange={field.onChange} value={field.value}>
+                        <FormControl>
+                          <SelectTrigger data-testid="select-product-currency">
+                            <SelectValue />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
+                          <SelectItem value="GBP">GBP (£)</SelectItem>
+                          <SelectItem value="EUR">EUR (€)</SelectItem>
+                          <SelectItem value="USD">USD ($)</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={newProductForm.control}
+                  name="notes"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Notes</FormLabel>
+                      <FormControl>
+                        <Input
+                          placeholder="Optional"
+                          value={field.value ?? ""}
+                          onChange={field.onChange}
+                          onBlur={field.onBlur}
+                          name={field.name}
+                          ref={field.ref}
+                          data-testid="input-product-notes"
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setIsCreateProductOpen(false)}
+                  data-testid="button-cancel-create-product"
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={createProductMutation.isPending}
+                  data-testid="button-save-product"
+                >
+                  {createProductMutation.isPending ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Saving...
+                    </>
+                  ) : (
+                    "Save Product"
+                  )}
+                </Button>
+              </DialogFooter>
+            </form>
+          </Form>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }

@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Link } from "wouter";
 import { FileText, Users, Package, TrendingUp, Plus, ArrowRight } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
-import type { PurchaseOrder } from "@shared/schema";
+import type { PurchaseOrder, Supplier } from "@shared/schema";
 import { Skeleton } from "@/components/ui/skeleton";
 
 export default function Dashboard() {
@@ -12,7 +12,7 @@ export default function Dashboard() {
     queryKey: ["/api/purchase-orders"],
   });
 
-  const { data: suppliers, isLoading: suppliersLoading } = useQuery({
+  const { data: suppliers, isLoading: suppliersLoading } = useQuery<Supplier[]>({
     queryKey: ["/api/suppliers"],
   });
 

@@ -15,6 +15,26 @@ import {
   type DraftPO,
 } from "@shared/schema";
 
+const poItemValidationSchema = z.object({
+  sku: z.string({ required_error: "SKU is required" }).min(1, "SKU is required"),
+  productName: z.string({ required_error: "Product name is required" }).min(1, "Product name is required"),
+  unitType: z.string({ required_error: "Unit type is required" }).min(1, "Unit type is required"),
+  requestedQuantityRaw: z.string().nullable().optional(),
+  quantity: z.coerce.number({ invalid_type_error: "Quantity must be a number" }).int("Quantity must be a whole number").positive("Quantity must be greater than zero"),
+  unitPrice: z.coerce.number({ invalid_type_error: "Unit price must be a number" }).nonnegative("Unit price must be zero or greater"),
+  currency: z.string({ required_error: "Currency is required" }).min(1, "Currency is required"),
+  lineTotal: z.union([
+    z.coerce.number({ invalid_type_error: "Line total must be a number" }).nonnegative(),
+    z.null(),
+  ]).optional(),
+  priceSource: z.string().nullable().optional(),
+  aiConfidence: z.union([
+    z.coerce.number({ invalid_type_error: "Confidence must be a number" }).min(0).max(1),
+    z.null(),
+  ]).optional(),
+  notes: z.string().nullable().optional(),
+});
+
 export async function registerRoutes(app: Express): Promise<Server> {
   app.get("/api/suppliers", async (_req, res) => {
     try {
@@ -81,6 +101,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error) {
       console.error("Error deleting price list row:", error);
       res.status(500).json({ error: "Failed to delete price list row" });
+    }
+  });
+
+  app.put("/api/price-lists/:id", async (req, res) => {
+    try {
+      const data = insertPriceListRowSchema.parse(req.body);
+      const priceRow = await storage.updatePriceListRow(req.params.id, data);
+      res.json(priceRow);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ error: "Invalid data", details: error.errors });
+      }
+      console.error("Error updating price list row:", error);
+      res.status(500).json({ error: "Failed to update price list row" });
     }
   });
 
@@ -215,43 +249,58 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const { items, ...poData } = req.body;
 
-      // Validate purchase order data
-      const validatedPoData = insertPurchaseOrderSchema.parse(poData);
+      const normalizedPoData = {
+        supplierName: poData.supplier_name ?? poData.supplierName,
+        status: poData.status ?? "draft",
+        extraNotesForSupplier: poData.extra_notes_for_supplier ?? poData.extraNotesForSupplier ?? null,
+        deliveryInstructions: poData.delivery_instructions ?? poData.deliveryInstructions ?? null,
+        userRequest: poData.userRequest ?? undefined,
+      };
 
-      // Validate items array if present
+      const validatedPoData = insertPurchaseOrderSchema.parse(normalizedPoData);
+
       if (items !== undefined && !Array.isArray(items)) {
         return res.status(400).json({ error: "Invalid data", details: [{ message: "items must be an array" }] });
       }
 
-      // Validate each item
-      if (items && Array.isArray(items)) {
-        for (let i = 0; i < items.length; i++) {
-          try {
-            insertPoItemSchema.omit({ poId: true }).parse(items[i]);
-          } catch (itemError) {
-            if (itemError instanceof z.ZodError) {
-              return res.status(400).json({ 
-                error: "Invalid data", 
-                details: itemError.errors.map(e => ({ ...e, itemIndex: i }))
-              });
-            }
-            throw itemError;
+      const normalizedItems = Array.isArray(items)
+        ? items.map((item) => ({
+            sku: item?.sku ?? "",
+            productName: item?.product_name ?? item?.productName ?? "",
+            unitType: item?.unit_type ?? item?.unitType ?? "",
+            requestedQuantityRaw: item?.requested_quantity_raw ?? item?.requestedQuantityRaw ?? null,
+            quantity: item?.quantity,
+            unitPrice: item?.unit_price ?? item?.unitPrice,
+            currency: item?.currency ?? "",
+            lineTotal: item?.line_total ?? item?.lineTotal ?? null,
+            priceSource: item?.price_source ?? item?.priceSource ?? null,
+            aiConfidence: item?.ai_confidence ?? item?.aiConfidence ?? null,
+            notes: item?.notes ?? null,
+          }))
+        : [];
+
+      const validatedItems = [] as Array<z.infer<typeof poItemValidationSchema>>;
+      for (let i = 0; i < normalizedItems.length; i++) {
+        try {
+          validatedItems.push(poItemValidationSchema.parse(normalizedItems[i]));
+        } catch (itemError) {
+          if (itemError instanceof z.ZodError) {
+            return res.status(400).json({
+              error: "Invalid data",
+              details: itemError.errors.map((e) => ({ ...e, itemIndex: i })),
+            });
           }
+          throw itemError;
         }
       }
 
-      // Create purchase order
       const po = await storage.createPurchaseOrder(validatedPoData);
 
-      // Create items
-      if (items && Array.isArray(items)) {
-        for (const item of items) {
-          const validatedItem = insertPoItemSchema.omit({ poId: true }).parse(item);
-          await storage.createPoItem({
-            ...validatedItem,
-            poId: po.id,
-          });
-        }
+      for (const item of validatedItems) {
+        await storage.createPoItem({
+          ...item,
+          poId: po.id,
+        });
       }
 
       const poWithItems = await storage.getPurchaseOrderWithItems(po.id);
