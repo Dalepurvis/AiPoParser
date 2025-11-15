@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -19,6 +19,7 @@ import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Separator } from "@/components/ui/separator";
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { z } from "zod";
 
 const examplePrompts = [
@@ -32,6 +33,7 @@ type UserRequestForm = z.infer<typeof userRequestFormSchema>;
 export default function CreatePO() {
   const [aiResponse, setAiResponse] = useState<AIParserResponse | null>(null);
   const [editingItems, setEditingItems] = useState<Record<number, DraftPOItem>>({});
+  const [clarificationAnswers, setClarificationAnswers] = useState<Record<string, string | number>>({});
   const { toast } = useToast();
   const [, navigate] = useLocation();
   
@@ -49,6 +51,7 @@ export default function CreatePO() {
     },
     onSuccess: (data) => {
       setAiResponse(data);
+      setClarificationAnswers({});
       toast({
         title: "Draft PO Generated",
         description: "Review the AI-generated draft and make any necessary adjustments.",
@@ -58,6 +61,44 @@ export default function CreatePO() {
       toast({
         title: "Error",
         description: "Failed to generate draft PO. Please try again.",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const clarifyDraftMutation = useMutation({
+    mutationFn: async () => {
+      if (!aiResponse) throw new Error("No draft to clarify");
+      const response = await apiRequest("POST", "/api/ai/clarify-draft-po", {
+        userRequest: form.getValues("userRequest"),
+        previousDraft: aiResponse,
+        answers: clarificationAnswers,
+      });
+      return await response.json() as AIParserResponse;
+    },
+    onSuccess: (data) => {
+      setAiResponse(data);
+      setClarificationAnswers({});
+      
+      const hasRemainingQuestions = data.questions_for_user.length > 0;
+      const questionsResolved = aiResponse ? aiResponse.questions_for_user.length - data.questions_for_user.length : 0;
+      
+      if (!hasRemainingQuestions) {
+        toast({
+          title: "All Clarifications Resolved!",
+          description: `Successfully resolved ${questionsResolved} question(s). Your draft is ready to save.`,
+        });
+      } else {
+        toast({
+          title: "Draft Updated",
+          description: `Resolved ${questionsResolved} question(s). Please answer the ${data.questions_for_user.length} remaining question(s).`,
+        });
+      }
+    },
+    onError: () => {
+      toast({
+        title: "Error",
+        description: "Failed to regenerate draft. Please try again.",
         variant: "destructive",
       });
     },
@@ -131,6 +172,41 @@ export default function CreatePO() {
     if (confidence >= 0.8) return "text-emerald-600 dark:text-emerald-400";
     if (confidence >= 0.5) return "text-amber-600 dark:text-amber-400";
     return "text-red-600 dark:text-red-400";
+  };
+
+  const handleClarificationAnswer = (questionId: string, value: string | number) => {
+    setClarificationAnswers({
+      ...clarificationAnswers,
+      [questionId]: value,
+    });
+  };
+
+  const detectQuestionType = (question: string): "sku" | "price" | "quantity" | "selection" | "text" => {
+    const lowerQuestion = question.toLowerCase();
+    if (lowerQuestion.includes("sku") || lowerQuestion.includes("product code")) return "sku";
+    if (lowerQuestion.includes("price") || lowerQuestion.includes("cost")) return "price";
+    if (lowerQuestion.includes("quantity") || lowerQuestion.includes("how many")) return "quantity";
+    if (lowerQuestion.includes("which") || lowerQuestion.includes("select") || lowerQuestion.includes("choose")) return "selection";
+    return "text";
+  };
+
+  const allQuestionsAnswered = useMemo(() => {
+    if (!aiResponse || aiResponse.questions_for_user.length === 0) return true;
+    return aiResponse.questions_for_user.every(q => 
+      clarificationAnswers[q.id] !== undefined && clarificationAnswers[q.id] !== ''
+    );
+  }, [aiResponse, clarificationAnswers]);
+
+  const handleContinueDraft = () => {
+    if (!allQuestionsAnswered) {
+      toast({
+        title: "Missing Answers",
+        description: "Please answer all clarification questions before continuing.",
+        variant: "destructive",
+      });
+      return;
+    }
+    clarifyDraftMutation.mutate();
   };
 
   return (
@@ -453,39 +529,125 @@ export default function CreatePO() {
                   <HelpCircle className="w-5 h-5" data-testid="icon-help-circle" />
                   AI Questions & Clarifications
                 </CardTitle>
-                <CardDescription data-testid="text-questions-description">The AI needs your input on these items</CardDescription>
+                <CardDescription data-testid="text-questions-description">
+                  Please answer these questions to help the AI improve the purchase order draft
+                </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
-                {aiResponse.questions_for_user.map((question, i) => (
-                  <Card key={question.id} className="bg-background" data-testid={`card-question-${i}`}>
-                    <CardContent className="pt-6">
-                      <div className="space-y-3">
-                        <div>
-                          <p className="font-medium mb-1" data-testid={`text-question-${i}`}>{question.question}</p>
-                          <p className="text-sm text-muted-foreground" data-testid={`text-question-reason-${i}`}>
-                            {question.reason}
-                          </p>
+                <Alert className="bg-background border-amber-300 dark:border-amber-700" data-testid="alert-reasoning">
+                  <AlertCircle className="w-4 h-4" />
+                  <AlertDescription data-testid="text-reasoning-explanation">
+                    <span className="font-medium">Why clarification is needed: </span>
+                    {aiResponse.reasoning_summary.overall_decision}
+                  </AlertDescription>
+                </Alert>
+
+                {aiResponse.questions_for_user.map((question, i) => {
+                  const questionType = detectQuestionType(question.question);
+                  const hasOptions = question.suggested_options.length > 0;
+                  
+                  return (
+                    <Card key={question.id} className="bg-background" data-testid={`card-question-${i}`}>
+                      <CardContent className="pt-6">
+                        <div className="space-y-3">
+                          <div>
+                            <Label className="text-base font-medium" data-testid={`label-question-${i}`}>
+                              {question.question} <span className="text-destructive">*</span>
+                            </Label>
+                            <p className="text-sm text-muted-foreground mt-1" data-testid={`text-question-reason-${i}`}>
+                              {question.reason}
+                            </p>
+                          </div>
+
+                          {hasOptions ? (
+                            question.suggested_options.length > 3 ? (
+                              <Select
+                                value={clarificationAnswers[question.id]?.toString() || ""}
+                                onValueChange={(value) => handleClarificationAnswer(question.id, value)}
+                              >
+                                <SelectTrigger data-testid={`select-question-${i}`}>
+                                  <SelectValue placeholder="Select an option..." />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  {question.suggested_options.map((option, j) => (
+                                    <SelectItem key={j} value={option} data-testid={`select-option-${i}-${j}`}>
+                                      {option}
+                                    </SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                            ) : (
+                              <RadioGroup
+                                value={clarificationAnswers[question.id]?.toString() || ""}
+                                onValueChange={(value) => handleClarificationAnswer(question.id, value)}
+                                data-testid={`radiogroup-question-${i}`}
+                              >
+                                {question.suggested_options.map((option, j) => (
+                                  <div key={j} className="flex items-center space-x-2">
+                                    <RadioGroupItem value={option} id={`${question.id}-${j}`} data-testid={`radio-option-${i}-${j}`} />
+                                    <Label
+                                      htmlFor={`${question.id}-${j}`}
+                                      className="text-sm font-normal cursor-pointer"
+                                      data-testid={`label-option-${i}-${j}`}
+                                    >
+                                      {option}
+                                    </Label>
+                                  </div>
+                                ))}
+                              </RadioGroup>
+                            )
+                          ) : questionType === "price" || questionType === "quantity" ? (
+                            <div className="space-y-2">
+                              <Input
+                                type="number"
+                                step={questionType === "price" ? "0.01" : "1"}
+                                min="0"
+                                placeholder={questionType === "price" ? "Enter price (e.g., 12.99)" : "Enter quantity"}
+                                value={clarificationAnswers[question.id] || ""}
+                                onChange={(e) => handleClarificationAnswer(question.id, parseFloat(e.target.value) || 0)}
+                                data-testid={`input-question-${i}`}
+                              />
+                              {questionType === "price" && (
+                                <p className="text-xs text-muted-foreground" data-testid={`text-price-hint-${i}`}>
+                                  Enter the unit price in GBP
+                                </p>
+                              )}
+                            </div>
+                          ) : (
+                            <Input
+                              type="text"
+                              placeholder={questionType === "sku" ? "Enter SKU/Product Code" : "Enter your answer"}
+                              value={clarificationAnswers[question.id] || ""}
+                              onChange={(e) => handleClarificationAnswer(question.id, e.target.value)}
+                              data-testid={`input-question-${i}`}
+                            />
+                          )}
                         </div>
-                        {question.suggested_options.length > 0 && (
-                          <RadioGroup data-testid={`radiogroup-question-${i}`}>
-                            {question.suggested_options.map((option, j) => (
-                              <div key={j} className="flex items-center space-x-2">
-                                <RadioGroupItem value={option} id={`${question.id}-${j}`} data-testid={`radio-option-${i}-${j}`} />
-                                <Label
-                                  htmlFor={`${question.id}-${j}`}
-                                  className="text-sm font-normal cursor-pointer"
-                                  data-testid={`label-option-${i}-${j}`}
-                                >
-                                  {option}
-                                </Label>
-                              </div>
-                            ))}
-                          </RadioGroup>
-                        )}
-                      </div>
-                    </CardContent>
-                  </Card>
-                ))}
+                      </CardContent>
+                    </Card>
+                  );
+                })}
+
+                <div className="flex gap-3 pt-2">
+                  <Button
+                    onClick={handleContinueDraft}
+                    disabled={!allQuestionsAnswered || clarifyDraftMutation.isPending}
+                    className="flex-1"
+                    data-testid="button-continue-draft"
+                  >
+                    {clarifyDraftMutation.isPending ? (
+                      <>
+                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                        Regenerating Draft...
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="w-4 h-4 mr-2" />
+                        Continue with Clarifications
+                      </>
+                    )}
+                  </Button>
+                </div>
               </CardContent>
             </Card>
           )}

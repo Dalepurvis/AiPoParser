@@ -196,7 +196,7 @@ export async function generateDraftPO(
   let response;
   try {
     response = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model: "gpt-4o-mini",
       messages,
       temperature: 0.0,
     });
@@ -263,6 +263,175 @@ export async function generateDraftPO(
       "Failed to parse AI response. The AI service returned an unexpected format.",
       500,
       { errorType: "json_parse_error", originalError: error.message }
+    );
+  }
+
+  return data as AIParserResponse;
+}
+
+export async function regeneratePOWithClarifications(
+  userRequest: string,
+  previousDraft: AIParserResponse,
+  answers: Record<string, any>,
+  businessRules: BusinessRules,
+  suppliers: Supplier[],
+  priceRows: PriceRow[]
+): Promise<AIParserResponse> {
+  checkOpenAICredentials();
+
+  const openai = new OpenAI({
+    baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
+    apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY
+  });
+
+  const systemMessage = buildSystemMessage(businessRules, suppliers, priceRows);
+
+  const questionsAsked = previousDraft.questions_for_user.map(q => ({
+    id: q.id,
+    question: q.question,
+    reason: q.reason,
+    related_item_indexes: q.related_item_indexes,
+    suggested_options: q.suggested_options,
+  }));
+
+  const answeredQuestionIds = Object.keys(answers);
+  const questionAnswerMapping = questionsAsked.map(q => ({
+    question_id: q.id,
+    question_text: q.question,
+    user_answer: answers[q.id] !== undefined ? answers[q.id] : "NOT ANSWERED",
+    affects_items: q.related_item_indexes,
+  }));
+
+  const clarificationContext = `
+CLARIFICATION UPDATE REQUIRED:
+
+The user has provided answers to clarification questions. You MUST use these answers to update the purchase order draft.
+
+QUESTION-ANSWER MAPPING:
+${JSON.stringify(questionAnswerMapping, null, 2)}
+
+PREVIOUS DRAFT (for reference only):
+${JSON.stringify(previousDraft.draft_po, null, 2)}
+
+CRITICAL INSTRUCTIONS FOR REGENERATION:
+
+1. USE THE ANSWERS TO UPDATE FIELDS:
+   - For each answered question, identify which item(s) it relates to (see affects_items)
+   - Update the relevant fields (SKU, product_name, unit_price, quantity, etc.) based on the user's answer
+   - If the answer provides a specific SKU, price, or product selection, use it EXACTLY
+   - Remove that field from ai_uncertain_fields if it was there
+
+2. UPDATE CONFIDENCE SCORES:
+   - For any item where fields were clarified by user answers, INCREASE ai_confidence
+   - If all uncertain fields for an item have been clarified, set ai_confidence to at least 0.9
+   - Update global_confidence in reasoning_summary accordingly
+
+3. MANAGE questions_for_user ARRAY:
+   - DO NOT include questions with IDs: ${JSON.stringify(answeredQuestionIds)}
+   - These questions have been answered and must NOT be asked again
+   - Only include NEW questions if there are still genuine uncertainties
+   - If all uncertainties are resolved, return an EMPTY array for questions_for_user
+
+4. VALIDATION:
+   - Verify that each answer was actually used to update the draft
+   - Ensure the draft reflects ALL the information provided by the user
+   - Double-check that answered questions are not in the new questions_for_user array
+
+EXAMPLE:
+If user answered a question about SKU selection with "SKU-12345", then:
+- Update the relevant item's sku field to "SKU-12345"
+- Remove "sku" from ai_uncertain_fields for that item
+- Increase ai_confidence for that item to at least 0.85
+- DO NOT include that question in the new questions_for_user array
+
+Remember: Return ONLY valid JSON matching the schema. The user has taken time to answer questions - you MUST incorporate their answers into the updated draft.
+`;
+
+  const messages = [
+    { role: "system" as const, content: systemMessage },
+    { role: "user" as const, content: `User request: "${userRequest}"` },
+    { role: "assistant" as const, content: JSON.stringify(previousDraft) },
+    { role: "user" as const, content: clarificationContext },
+  ];
+
+  let response;
+  try {
+    response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages,
+      temperature: 0.0,
+    });
+  } catch (error: any) {
+    console.error("OpenAI API call failed during clarification:", error);
+
+    if (error?.status === 401 || error?.code === "invalid_api_key") {
+      throw new AIParserError(
+        "OpenAI authentication failed. Please check your API key configuration.",
+        503,
+        { errorType: "authentication", originalError: error.message }
+      );
+    }
+
+    if (error?.status === 429 || error?.code === "rate_limit_exceeded") {
+      throw new AIParserError(
+        "OpenAI rate limit exceeded. Please try again in a few moments.",
+        503,
+        { errorType: "rate_limit", originalError: error.message }
+      );
+    }
+
+    if (error?.status === 503 || error?.code === "service_unavailable") {
+      throw new AIParserError(
+        "OpenAI service is temporarily unavailable. Please try again later.",
+        503,
+        { errorType: "service_unavailable", originalError: error.message }
+      );
+    }
+
+    if (error?.code === "ENOTFOUND" || error?.code === "ECONNREFUSED" || error?.code === "ETIMEDOUT") {
+      throw new AIParserError(
+        "Unable to connect to OpenAI service. Please check your network connection.",
+        503,
+        { errorType: "network", originalError: error.message }
+      );
+    }
+
+    throw new AIParserError(
+      "Failed to regenerate purchase order draft. Please try again.",
+      500,
+      { errorType: "unknown", originalError: error.message }
+    );
+  }
+
+  const rawText = response.choices[0]?.message?.content || "";
+  
+  if (!rawText) {
+    console.error("OpenAI returned empty response during clarification");
+    throw new AIParserError(
+      "AI service returned an empty response. Please try again.",
+      500,
+      { errorType: "empty_response" }
+    );
+  }
+
+  let data;
+  try {
+    data = extractJson(rawText);
+  } catch (error: any) {
+    console.error("Failed to parse AI clarification response as JSON:", error.message);
+    console.error("Raw response:", rawText);
+    throw new AIParserError(
+      "Failed to parse AI response. The AI service returned an unexpected format.",
+      500,
+      { errorType: "json_parse_error", originalError: error.message }
+    );
+  }
+
+  // Safety post-processing: ensure answered questions are removed
+  const answeredIds = Object.keys(answers);
+  if (data.questions_for_user && Array.isArray(data.questions_for_user)) {
+    data.questions_for_user = data.questions_for_user.filter(
+      (q: any) => !answeredIds.includes(q.id)
     );
   }
 

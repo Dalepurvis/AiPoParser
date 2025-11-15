@@ -1,7 +1,9 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
-import { generateDraftPO, AIParserError } from "./ai-parser";
+import { generateDraftPO, regeneratePOWithClarifications, AIParserError } from "./ai-parser";
+import { parseDocument, DocumentParserError } from "./document-parser";
+import multer from "multer";
 import { z } from "zod";
 import {
   insertSupplierSchema,
@@ -9,6 +11,7 @@ import {
   insertPurchaseOrderSchema,
   insertPoItemSchema,
   insertBusinessRuleSchema,
+  clarificationAnswersSchema,
   type DraftPO,
 } from "@shared/schema";
 
@@ -78,6 +81,110 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error) {
       console.error("Error deleting price list row:", error);
       res.status(500).json({ error: "Failed to delete price list row" });
+    }
+  });
+
+  // Configure multer for file uploads
+  const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+      fileSize: 10 * 1024 * 1024, // 10MB limit
+    },
+    fileFilter: (_req, file, cb) => {
+      const allowedMimes = [
+        'application/pdf',
+        'text/csv',
+        'image/png',
+        'image/jpeg',
+        'image/jpg',
+      ];
+      if (allowedMimes.includes(file.mimetype) || file.originalname.toLowerCase().endsWith('.csv')) {
+        cb(null, true);
+      } else {
+        cb(new Error('Invalid file type. Only PDF, CSV, PNG, and JPG files are allowed.'));
+      }
+    },
+  });
+
+  app.post("/api/price-lists/upload", upload.single('file'), async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "No file uploaded" });
+      }
+
+      const supplierId = req.body.supplierId;
+      if (!supplierId) {
+        return res.status(400).json({ error: "Supplier ID is required" });
+      }
+
+      // Verify supplier exists
+      const supplier = await storage.getSupplier(supplierId);
+      if (!supplier) {
+        return res.status(404).json({ error: "Supplier not found" });
+      }
+
+      // Parse the document
+      const result = await parseDocument(
+        req.file.buffer,
+        req.file.originalname,
+        req.file.mimetype
+      );
+
+      res.json({
+        ...result,
+        supplierId
+      });
+    } catch (error) {
+      if (error instanceof DocumentParserError) {
+        return res.status(error.statusCode).json({ 
+          error: error.message,
+          details: error.details
+        });
+      }
+      if (error instanceof Error && error.message.includes('Invalid file type')) {
+        return res.status(400).json({ error: error.message });
+      }
+      console.error("Error uploading price list:", error);
+      res.status(500).json({ error: "Failed to process uploaded file" });
+    }
+  });
+
+  app.post("/api/price-lists/confirm", async (req, res) => {
+    try {
+      const confirmSchema = z.object({
+        supplierId: z.string().min(1, "Supplier ID is required"),
+        items: z.array(insertPriceListRowSchema.omit({ supplierId: true })).min(1, "At least one item is required"),
+      });
+
+      const { supplierId, items } = confirmSchema.parse(req.body);
+
+      // Verify supplier exists
+      const supplier = await storage.getSupplier(supplierId);
+      if (!supplier) {
+        return res.status(404).json({ error: "Supplier not found" });
+      }
+
+      // Create all price list rows
+      const createdRows = [];
+      for (const item of items) {
+        const row = await storage.createPriceListRow({
+          ...item,
+          supplierId,
+        });
+        createdRows.push(row);
+      }
+
+      res.json({
+        success: true,
+        count: createdRows.length,
+        items: createdRows,
+      });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ error: "Invalid data", details: error.errors });
+      }
+      console.error("Error confirming price list items:", error);
+      res.status(500).json({ error: "Failed to save price list items" });
     }
   });
 
@@ -270,6 +377,73 @@ export async function registerRoutes(app: Express): Promise<Server> {
       console.error("Unexpected error generating draft PO:", error);
       res.status(500).json({ 
         error: "An unexpected error occurred while generating the purchase order draft. Please try again.",
+        details: { errorType: "internal_server_error" }
+      });
+    }
+  });
+
+  app.post("/api/ai/clarify-draft-po", async (req, res) => {
+    try {
+      const { userRequest, previousDraft, answers } = clarificationAnswersSchema.parse(req.body);
+
+      if (!answers || Object.keys(answers).length === 0) {
+        return res.status(400).json({ 
+          error: "No clarification answers provided",
+          details: { errorType: "missing_answers" }
+        });
+      }
+
+      // Validate that answer keys correspond to actual questions
+      const questionIds = previousDraft.questions_for_user.map(q => q.id);
+      const answerKeys = Object.keys(answers);
+      const invalidKeys = answerKeys.filter(key => !questionIds.includes(key));
+      
+      if (invalidKeys.length > 0) {
+        return res.status(400).json({
+          error: "Invalid answer keys provided. All answers must correspond to current questions.",
+          details: { invalidKeys, validQuestionIds: questionIds }
+        });
+      }
+
+      const suppliers = await storage.getSuppliers();
+      const priceRows = await storage.getPriceListRows();
+      const businessRulesArray = await storage.getBusinessRules();
+
+      const businessRules: Record<string, string> = {};
+      businessRulesArray.forEach((rule) => {
+        businessRules[rule.key] = rule.value;
+      });
+
+      const result = await regeneratePOWithClarifications(
+        userRequest,
+        previousDraft,
+        answers,
+        businessRules,
+        suppliers,
+        priceRows
+      );
+
+      res.json(result);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        console.error("Validation error in AI clarify draft PO:", error.errors);
+        return res.status(400).json({ 
+          error: "Invalid request data", 
+          details: error.errors 
+        });
+      }
+
+      if (error instanceof AIParserError) {
+        console.error(`AI Parser Error (${error.statusCode}):`, error.message, error.details);
+        return res.status(error.statusCode).json({
+          error: error.message,
+          details: error.details
+        });
+      }
+
+      console.error("Unexpected error clarifying draft PO:", error);
+      res.status(500).json({ 
+        error: "An unexpected error occurred while regenerating the purchase order. Please try again.",
         details: { errorType: "internal_server_error" }
       });
     }

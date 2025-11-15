@@ -158,3 +158,12 @@ export const businessRulesFormSchema = z.object({
   fitting_rate_per_m2: z.coerce.number().positive("Fitting rate must be positive"),
   notes: z.string().optional(),
 });
+
+export const clarificationAnswersSchema = z.object({
+  userRequest: z.string().min(1, "Original user request is required"),
+  previousDraft: z.custom<AIParserResponse>(),
+  answers: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])),
+}).refine((data) => Object.keys(data.answers).length > 0, {
+  message: "At least one clarification answer must be provided",
+  path: ["answers"]
+});
