@@ -10,8 +10,14 @@ import {
   type BusinessRule,
   type InsertBusinessRule,
   type PurchaseOrderWithItems,
+  suppliers,
+  priceListRows,
+  purchaseOrders,
+  poItems,
+  businessRules,
 } from "@shared/schema";
-import { randomUUID } from "crypto";
+import { db } from "./db";
+import { eq, desc } from "drizzle-orm";
 
 export interface IStorage {
   getSuppliers(): Promise<Supplier[]>;
@@ -45,151 +51,58 @@ export interface IStorage {
   deleteBusinessRule(id: string): Promise<void>;
 }
 
-export class MemStorage implements IStorage {
-  private suppliers: Map<string, Supplier>;
-  private priceListRows: Map<string, PriceListRow>;
-  private purchaseOrders: Map<string, PurchaseOrder>;
-  private poItems: Map<string, PoItem>;
-  private businessRules: Map<string, BusinessRule>;
-
-  constructor() {
-    this.suppliers = new Map();
-    this.priceListRows = new Map();
-    this.purchaseOrders = new Map();
-    this.poItems = new Map();
-    this.businessRules = new Map();
-
-    this.initializeSampleData();
-  }
-
-  private initializeSampleData() {
-    const supplier1 = this.createSupplierSync({
-      name: "EverFloor Supplies",
-      email: "orders@everfloor.example.com",
-      phone: "+44 1234 567890",
-      address: "123 Industrial Estate, Manchester, M1 1AA",
-    });
-
-    this.createPriceListRowSync({
-      supplierId: supplier1.id,
-      sku: "HYDRO-301",
-      productName: "HydroLoc Grey Herringbone",
-      unitType: "box",
-      minQty: 1,
-      maxQty: 49,
-      unitPrice: 18.99,
-      currency: "GBP",
-      notes: "Standard box price",
-    });
-
-    this.createPriceListRowSync({
-      supplierId: supplier1.id,
-      sku: "HYDRO-301",
-      productName: "HydroLoc Grey Herringbone",
-      unitType: "pallet",
-      minQty: 50,
-      maxQty: null,
-      unitPrice: 17.50,
-      currency: "GBP",
-      notes: "Discounted pallet price (50 boxes)",
-    });
-
-    this.createBusinessRuleSync({
-      key: "default_currency",
-      value: "GBP",
-      description: "Default currency for purchase orders",
-    });
-
-    this.createBusinessRuleSync({
-      key: "default_tax_rate",
-      value: "20",
-      description: "Default VAT rate percentage",
-    });
-
-    this.createBusinessRuleSync({
-      key: "fitting_rate_per_m2",
-      value: "15",
-      description: "Standard fitting cost per square meter",
-    });
-  }
-
-  private createSupplierSync(insertSupplier: InsertSupplier): Supplier {
-    const id = randomUUID();
-    const supplier: Supplier = { ...insertSupplier, id };
-    this.suppliers.set(id, supplier);
-    return supplier;
-  }
-
-  private createPriceListRowSync(insertRow: InsertPriceListRow): PriceListRow {
-    const id = randomUUID();
-    const row: PriceListRow = { ...insertRow, id };
-    this.priceListRows.set(id, row);
-    return row;
-  }
-
-  private createBusinessRuleSync(insertRule: InsertBusinessRule): BusinessRule {
-    const id = randomUUID();
-    const rule: BusinessRule = { ...insertRule, id };
-    this.businessRules.set(id, rule);
-    return rule;
-  }
-
+export class DatabaseStorage implements IStorage {
   async getSuppliers(): Promise<Supplier[]> {
-    return Array.from(this.suppliers.values());
+    return await db.select().from(suppliers);
   }
 
   async getSupplier(id: string): Promise<Supplier | undefined> {
-    return this.suppliers.get(id);
+    const [supplier] = await db.select().from(suppliers).where(eq(suppliers.id, id));
+    return supplier || undefined;
   }
 
   async createSupplier(insertSupplier: InsertSupplier): Promise<Supplier> {
-    const id = randomUUID();
-    const supplier: Supplier = { ...insertSupplier, id };
-    this.suppliers.set(id, supplier);
+    const [supplier] = await db.insert(suppliers).values(insertSupplier).returning();
     return supplier;
   }
 
   async deleteSupplier(id: string): Promise<void> {
-    this.suppliers.delete(id);
+    await db.delete(suppliers).where(eq(suppliers.id, id));
   }
 
   async getPriceListRows(): Promise<PriceListRow[]> {
-    return Array.from(this.priceListRows.values());
+    return await db.select().from(priceListRows);
   }
 
   async getPriceListRow(id: string): Promise<PriceListRow | undefined> {
-    return this.priceListRows.get(id);
+    const [row] = await db.select().from(priceListRows).where(eq(priceListRows.id, id));
+    return row || undefined;
   }
 
   async getPriceListRowsBySupplierId(supplierId: string): Promise<PriceListRow[]> {
-    return Array.from(this.priceListRows.values()).filter(
-      (row) => row.supplierId === supplierId
-    );
+    return await db.select().from(priceListRows).where(eq(priceListRows.supplierId, supplierId));
   }
 
   async createPriceListRow(insertRow: InsertPriceListRow): Promise<PriceListRow> {
-    const id = randomUUID();
-    const row: PriceListRow = { ...insertRow, id };
-    this.priceListRows.set(id, row);
+    const [row] = await db.insert(priceListRows).values(insertRow).returning();
     return row;
   }
 
   async deletePriceListRow(id: string): Promise<void> {
-    this.priceListRows.delete(id);
+    await db.delete(priceListRows).where(eq(priceListRows.id, id));
   }
 
   async getPurchaseOrders(): Promise<PurchaseOrder[]> {
-    return Array.from(this.purchaseOrders.values()).sort(
-      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-    );
+    return await db.select().from(purchaseOrders).orderBy(desc(purchaseOrders.createdAt));
   }
 
   async getPurchaseOrder(id: string): Promise<PurchaseOrder | undefined> {
-    return this.purchaseOrders.get(id);
+    const [po] = await db.select().from(purchaseOrders).where(eq(purchaseOrders.id, id));
+    return po || undefined;
   }
 
   async getPurchaseOrderWithItems(id: string): Promise<PurchaseOrderWithItems | undefined> {
-    const po = this.purchaseOrders.get(id);
+    const [po] = await db.select().from(purchaseOrders).where(eq(purchaseOrders.id, id));
     if (!po) return undefined;
 
     const items = await this.getPoItemsByPoId(id);
@@ -197,77 +110,72 @@ export class MemStorage implements IStorage {
   }
 
   async createPurchaseOrder(insertPo: InsertPurchaseOrder): Promise<PurchaseOrder> {
-    const id = randomUUID();
-    const po: PurchaseOrder = {
-      ...insertPo,
-      id,
-      createdAt: new Date(),
-    };
-    this.purchaseOrders.set(id, po);
+    const [po] = await db.insert(purchaseOrders).values(insertPo).returning();
     return po;
   }
 
   async deletePurchaseOrder(id: string): Promise<void> {
-    this.purchaseOrders.delete(id);
-    const items = await this.getPoItemsByPoId(id);
-    items.forEach((item) => this.poItems.delete(item.id));
+    await db.delete(poItems).where(eq(poItems.poId, id));
+    await db.delete(purchaseOrders).where(eq(purchaseOrders.id, id));
   }
 
   async getPoItems(): Promise<PoItem[]> {
-    return Array.from(this.poItems.values());
+    return await db.select().from(poItems);
   }
 
   async getPoItem(id: string): Promise<PoItem | undefined> {
-    return this.poItems.get(id);
+    const [item] = await db.select().from(poItems).where(eq(poItems.id, id));
+    return item || undefined;
   }
 
   async getPoItemsByPoId(poId: string): Promise<PoItem[]> {
-    return Array.from(this.poItems.values()).filter((item) => item.poId === poId);
+    return await db.select().from(poItems).where(eq(poItems.poId, poId));
   }
 
   async createPoItem(insertItem: InsertPoItem): Promise<PoItem> {
-    const id = randomUUID();
-    const item: PoItem = { ...insertItem, id };
-    this.poItems.set(id, item);
+    const [item] = await db.insert(poItems).values(insertItem).returning();
     return item;
   }
 
   async deletePoItem(id: string): Promise<void> {
-    this.poItems.delete(id);
+    await db.delete(poItems).where(eq(poItems.id, id));
   }
 
   async getBusinessRules(): Promise<BusinessRule[]> {
-    return Array.from(this.businessRules.values());
+    return await db.select().from(businessRules);
   }
 
   async getBusinessRule(id: string): Promise<BusinessRule | undefined> {
-    return this.businessRules.get(id);
+    const [rule] = await db.select().from(businessRules).where(eq(businessRules.id, id));
+    return rule || undefined;
   }
 
   async getBusinessRuleByKey(key: string): Promise<BusinessRule | undefined> {
-    return Array.from(this.businessRules.values()).find((rule) => rule.key === key);
+    const [rule] = await db.select().from(businessRules).where(eq(businessRules.key, key));
+    return rule || undefined;
   }
 
   async createBusinessRule(insertRule: InsertBusinessRule): Promise<BusinessRule> {
-    const id = randomUUID();
-    const rule: BusinessRule = { ...insertRule, id };
-    this.businessRules.set(id, rule);
+    const [rule] = await db.insert(businessRules).values(insertRule).returning();
     return rule;
   }
 
   async updateBusinessRule(key: string, value: string): Promise<BusinessRule> {
     const existing = await this.getBusinessRuleByKey(key);
     if (existing) {
-      existing.value = value;
-      this.businessRules.set(existing.id, existing);
-      return existing;
+      const [updated] = await db
+        .update(businessRules)
+        .set({ value })
+        .where(eq(businessRules.key, key))
+        .returning();
+      return updated;
     }
     return this.createBusinessRule({ key, value, description: null });
   }
 
   async deleteBusinessRule(id: string): Promise<void> {
-    this.businessRules.delete(id);
+    await db.delete(businessRules).where(eq(businessRules.id, id));
   }
 }
 
-export const storage = new MemStorage();
+export const storage = new DatabaseStorage();
