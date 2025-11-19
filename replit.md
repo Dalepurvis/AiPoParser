@@ -151,3 +151,14 @@ Preferred communication style: Simple, everyday language.
 - `DATABASE_URL` - PostgreSQL connection string (when switching from in-memory storage)
 
 **Note**: The application currently uses in-memory storage and will need database provisioning to persist data across restarts.
+
+## Deploying updates on Replit
+
+To test the latest branch on Replit after pulling changes into this repository:
+
+1. Commit your work locally and push the branch (for example `work`) using the standard Git workflow—run `git add .`, then `git commit -m "describe your change"`, and finally `git push origin work` from your development machine.
+2. In your Replit workspace, open the **Shell** tab (left sidebar → _Tools_ → _Shell_) and run `git pull` to fetch the updated branch. This shell is where you would also type the Git commands above if you needed to commit directly from Replit.
+3. Install dependencies if required (`npm install`) and start the app with `npm run dev`.
+4. Ensure the required secrets (such as `AI_INTEGRATIONS_OPENAI_API_KEY`) are configured in the Replit Secrets manager so the combined frontend/backend dev server can access them.
+
+Replit will expose the port defined by the `PORT` environment variable (defaults to `5000` in `server/index.ts`); open the generated web preview URL to verify the changes.

@@ -1,5 +1,8 @@
-import type { Express } from "express";
+import express, { type Express } from "express";
 import { createServer, type Server } from "http";
+import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { storage } from "./storage";
 import { generateDraftPO, regeneratePOWithClarifications, AIParserError } from "./ai-parser";
 import { parseDocument, DocumentParserError } from "./document-parser";
@@ -13,9 +16,152 @@ import {
   insertBusinessRuleSchema,
   clarificationAnswersSchema,
   type DraftPO,
+  type AIParserResponse,
+  type PurchaseOrderWithItems,
 } from "@shared/schema";
 
+const poItemValidationSchema = z.object({
+  sku: z.string({ required_error: "SKU is required" }).min(1, "SKU is required"),
+  productName: z.string({ required_error: "Product name is required" }).min(1, "Product name is required"),
+  unitType: z.string({ required_error: "Unit type is required" }).min(1, "Unit type is required"),
+  requestedQuantityRaw: z.string().nullable().optional(),
+  quantity: z.coerce.number({ invalid_type_error: "Quantity must be a number" }).int("Quantity must be a whole number").positive("Quantity must be greater than zero"),
+  unitPrice: z.coerce.number({ invalid_type_error: "Unit price must be a number" }).nonnegative("Unit price must be zero or greater"),
+  currency: z.string({ required_error: "Currency is required" }).min(1, "Currency is required"),
+  lineTotal: z.union([
+    z.coerce.number({ invalid_type_error: "Line total must be a number" }).nonnegative(),
+    z.null(),
+  ]).optional(),
+  priceSource: z.string().nullable().optional(),
+  aiConfidence: z.union([
+    z.coerce.number({ invalid_type_error: "Confidence must be a number" }).min(0).max(1),
+    z.null(),
+  ]).optional(),
+  notes: z.string().nullable().optional(),
+});
+
+const chatRequestSchema = z.object({
+  message: z.string().min(1, "Message cannot be empty"),
+  context: z.object({
+    currentDraft: z.custom<AIParserResponse>().optional(),
+    userRequest: z.string().optional(),
+    answers: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
+  }).optional(),
+});
+
+const pdfOutputDir = path.join(process.cwd(), "attached_assets", "po-pdfs");
+fs.mkdirSync(pdfOutputDir, { recursive: true });
+
+type ChatAssistantMessage = {
+  id: string;
+  variant: "text" | "summary" | "questions" | "history";
+  content: string;
+  meta?: Record<string, unknown>;
+};
+
+function buildBusinessRuleMap(rules: Array<{ key: string; value: string }>): Record<string, string> {
+  return rules.reduce<Record<string, string>>((acc, rule) => {
+    acc[rule.key] = rule.value;
+    return acc;
+  }, {});
+}
+
+function escapePdfText(input: string): string {
+  return input.replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
+}
+
+function createSimplePdf(lines: string[]): Buffer {
+  const sanitizedLines = lines.map((line) => escapePdfText(line));
+  let content = "BT\n/F1 12 Tf\n50 760 Td\n";
+  sanitizedLines.forEach((line, index) => {
+    if (index === 0) {
+      content += `(${line}) Tj\n`;
+    } else {
+      content += `0 -18 Td (${line}) Tj\n`;
+    }
+  });
+  content += "ET";
+
+  const contentLength = Buffer.byteLength(content, "utf8");
+
+  const objects: string[] = [];
+  objects.push("<< /Type /Catalog /Pages 2 0 R >>"); // 1
+  objects.push("<< /Type /Pages /Kids [3 0 R] /Count 1 >>"); // 2
+  objects.push("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>"); //3
+  objects.push(`<< /Length ${contentLength} >>\nstream\n${content}\nendstream`); //4
+  objects.push("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"); //5
+
+  let pdf = "%PDF-1.4\n";
+  const offsets: number[] = [0];
+  let currentOffset = pdf.length;
+  objects.forEach((body, idx) => {
+    const objectString = `${idx + 1} 0 obj\n${body}\nendobj\n`;
+    pdf += objectString;
+    offsets.push(currentOffset);
+    currentOffset += objectString.length;
+  });
+
+  const xrefOffset = pdf.length;
+  let xref = `xref\n0 ${objects.length + 1}\n`;
+  xref += "0000000000 65535 f \n";
+  for (let i = 1; i <= objects.length; i++) {
+    const offset = offsets[i];
+    xref += `${offset.toString().padStart(10, "0")} 00000 n \n`;
+  }
+  pdf += xref;
+  const trailer = `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+  pdf += trailer;
+
+  return Buffer.from(pdf, "utf8");
+}
+
+async function generatePurchaseOrderPdf(
+  po: PurchaseOrderWithItems,
+  businessRules: Record<string, string>,
+): Promise<{ url: string; fileName: string }> {
+  const companyName = businessRules.company_name || "Your Company";
+  const companyAddress = businessRules.company_address || "";
+  const lines: string[] = [
+    `${companyName} – Purchase Order`,
+    companyAddress,
+    "",
+    `PO ID: ${po.id}`,
+    `Supplier: ${po.supplierName}`,
+    `Status: ${po.status}`,
+    "",
+    "Items:",
+  ];
+
+  po.items.forEach((item, index) => {
+    const price = item.unitPrice ? `${item.currency} ${item.unitPrice.toFixed(2)}` : "Price TBD";
+    lines.push(
+      `${index + 1}. ${item.productName} – ${item.quantity} ${item.unitType} @ ${price}`,
+    );
+  });
+
+  if (po.extraNotesForSupplier) {
+    lines.push("", "Notes: " + po.extraNotesForSupplier);
+  }
+
+  if (po.deliveryInstructions) {
+    lines.push("Delivery: " + po.deliveryInstructions);
+  }
+
+  const fileName = `po-${po.id}.pdf`;
+  const filePath = path.join(pdfOutputDir, fileName);
+  const pdfBuffer = createSimplePdf(lines);
+  await fs.promises.writeFile(filePath, pdfBuffer);
+  return { url: `/generated-pdfs/${fileName}`, fileName };
+}
+
+function extractAddressFromMessage(message: string): string | null {
+  const match = message.match(/address(?: is|:)?\s+(.*)/i);
+  return match ? match[1].trim() : null;
+}
+
 export async function registerRoutes(app: Express): Promise<Server> {
+  app.use("/generated-pdfs", express.static(pdfOutputDir));
+
   app.get("/api/suppliers", async (_req, res) => {
     try {
       const suppliers = await storage.getSuppliers();
@@ -84,6 +230,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  app.put("/api/price-lists/:id", async (req, res) => {
+    try {
+      const data = insertPriceListRowSchema.parse(req.body);
+      const priceRow = await storage.updatePriceListRow(req.params.id, data);
+      res.json(priceRow);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ error: "Invalid data", details: error.errors });
+      }
+      console.error("Error updating price list row:", error);
+      res.status(500).json({ error: "Failed to update price list row" });
+    }
+  });
+
   // Configure multer for file uploads
   const upload = multer({
     storage: multer.memoryStorage(),
@@ -92,21 +252,21 @@ export async function registerRoutes(app: Express): Promise<Server> {
     },
     fileFilter: (_req, file, cb) => {
       const allowedMimes = [
-        'application/pdf',
-        'text/csv',
-        'image/png',
-        'image/jpeg',
-        'image/jpg',
+        "application/pdf",
+        "text/csv",
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
       ];
-      if (allowedMimes.includes(file.mimetype) || file.originalname.toLowerCase().endsWith('.csv')) {
+      if (allowedMimes.includes(file.mimetype) || file.originalname.toLowerCase().endsWith(".csv")) {
         cb(null, true);
       } else {
-        cb(new Error('Invalid file type. Only PDF, CSV, PNG, and JPG files are allowed.'));
+        cb(new Error("Invalid file type. Only PDF, CSV, PNG, and JPG files are allowed."));
       }
     },
   });
 
-  app.post("/api/price-lists/upload", upload.single('file'), async (req, res) => {
+  app.post("/api/price-lists/upload", upload.single("file"), async (req, res) => {
     try {
       if (!req.file) {
         return res.status(400).json({ error: "No file uploaded" });
@@ -215,47 +375,69 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       const { items, ...poData } = req.body;
 
-      // Validate purchase order data
-      const validatedPoData = insertPurchaseOrderSchema.parse(poData);
+      const normalizedPoData = {
+        supplierName: poData.supplier_name ?? poData.supplierName,
+        status: poData.status ?? "draft",
+        extraNotesForSupplier: poData.extra_notes_for_supplier ?? poData.extraNotesForSupplier ?? null,
+        deliveryInstructions: poData.delivery_instructions ?? poData.deliveryInstructions ?? null,
+        userRequest: poData.userRequest ?? undefined,
+      };
 
-      // Validate items array if present
+      const validatedPoData = insertPurchaseOrderSchema.parse(normalizedPoData);
+
       if (items !== undefined && !Array.isArray(items)) {
         return res.status(400).json({ error: "Invalid data", details: [{ message: "items must be an array" }] });
       }
 
-      // Validate each item
-      if (items && Array.isArray(items)) {
-        for (let i = 0; i < items.length; i++) {
-          try {
-            insertPoItemSchema.omit({ poId: true }).parse(items[i]);
-          } catch (itemError) {
-            if (itemError instanceof z.ZodError) {
-              return res.status(400).json({ 
-                error: "Invalid data", 
-                details: itemError.errors.map(e => ({ ...e, itemIndex: i }))
-              });
-            }
-            throw itemError;
+      const normalizedItems = Array.isArray(items)
+        ? items.map((item) => ({
+            sku: item?.sku ?? "",
+            productName: item?.product_name ?? item?.productName ?? "",
+            unitType: item?.unit_type ?? item?.unitType ?? "",
+            requestedQuantityRaw: item?.requested_quantity_raw ?? item?.requestedQuantityRaw ?? null,
+            quantity: item?.quantity,
+            unitPrice: item?.unit_price ?? item?.unitPrice,
+            currency: item?.currency ?? "",
+            lineTotal: item?.line_total ?? item?.lineTotal ?? null,
+            priceSource: item?.price_source ?? item?.priceSource ?? null,
+            aiConfidence: item?.ai_confidence ?? item?.aiConfidence ?? null,
+            notes: item?.notes ?? null,
+          }))
+        : [];
+
+      const validatedItems = [] as Array<z.infer<typeof poItemValidationSchema>>;
+      for (let i = 0; i < normalizedItems.length; i++) {
+        try {
+          validatedItems.push(poItemValidationSchema.parse(normalizedItems[i]));
+        } catch (itemError) {
+          if (itemError instanceof z.ZodError) {
+            return res.status(400).json({
+              error: "Invalid data",
+              details: itemError.errors.map((e) => ({ ...e, itemIndex: i })),
+            });
           }
+          throw itemError;
         }
       }
 
-      // Create purchase order
       const po = await storage.createPurchaseOrder(validatedPoData);
 
-      // Create items
-      if (items && Array.isArray(items)) {
-        for (const item of items) {
-          const validatedItem = insertPoItemSchema.omit({ poId: true }).parse(item);
-          await storage.createPoItem({
-            ...validatedItem,
-            poId: po.id,
-          });
-        }
+      for (const item of validatedItems) {
+        await storage.createPoItem({
+          ...item,
+          poId: po.id,
+        });
       }
 
       const poWithItems = await storage.getPurchaseOrderWithItems(po.id);
-      res.json(poWithItems);
+      if (!poWithItems) {
+        return res.status(500).json({ error: "Failed to load purchase order after save" });
+      }
+
+      const businessRulesMap = buildBusinessRuleMap(await storage.getBusinessRules());
+      const pdf = await generatePurchaseOrderPdf(poWithItems, businessRulesMap);
+
+      res.json({ ...poWithItems, pdf });
     } catch (error) {
       if (error instanceof z.ZodError) {
         return res.status(400).json({ error: "Invalid data", details: error.errors });
@@ -332,6 +514,119 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  app.post("/api/chat", async (req, res) => {
+    try {
+      const { message, context } = chatRequestSchema.parse(req.body);
+      const normalized = message.toLowerCase();
+      const assistantMessages: ChatAssistantMessage[] = [];
+
+      if (normalized.includes("last") && normalized.includes("purchase order")) {
+        const recentOrders = (await storage.getPurchaseOrders()).slice(0, 3);
+        assistantMessages.push({
+          id: randomUUID(),
+          variant: "history",
+          content: `Here ${recentOrders.length === 1 ? "is" : "are"} your last ${recentOrders.length} purchase order${recentOrders.length === 1 ? "" : "s"}.`,
+          meta: { purchaseOrders: recentOrders },
+        });
+        return res.json({ assistantMessages, updatedDraft: context?.currentDraft ?? null, purchaseOrders: recentOrders });
+      }
+
+      if (normalized.includes("address")) {
+        const address = extractAddressFromMessage(message) ?? message;
+        const rule = await storage.updateBusinessRule("company_address", address);
+        assistantMessages.push({
+          id: randomUUID(),
+          variant: "text",
+          content: `Updated your company address to: ${rule.value}. I'll use this on all future paperwork.`,
+        });
+        return res.json({ assistantMessages, updatedSettings: { company_address: rule.value } });
+      }
+
+      const suppliers = await storage.getSuppliers();
+      const priceRows = await storage.getPriceListRows();
+      const businessRulesArray = await storage.getBusinessRules();
+      const businessRules = buildBusinessRuleMap(businessRulesArray);
+
+      if (context?.answers && context.currentDraft) {
+        const payload = clarificationAnswersSchema.parse({
+          userRequest: context.userRequest ?? message,
+          previousDraft: context.currentDraft,
+          answers: context.answers,
+        });
+
+        const updatedDraft = await regeneratePOWithClarifications(
+          payload.userRequest,
+          payload.previousDraft,
+          payload.answers,
+          businessRules,
+          suppliers,
+          priceRows,
+        );
+
+        assistantMessages.push({
+          id: randomUUID(),
+          variant: "text",
+          content: "Thanks — I've used those answers to tighten up the draft.",
+        });
+
+        if (updatedDraft.questions_for_user.length > 0) {
+          assistantMessages.push({
+            id: randomUUID(),
+            variant: "questions",
+            content: "I still need a couple more details before we can send this.",
+            meta: { questions: updatedDraft.questions_for_user },
+          });
+        }
+
+        return res.json({ assistantMessages, updatedDraft });
+      }
+
+      const result = await generateDraftPO(
+        message,
+        businessRules,
+        suppliers,
+        priceRows,
+      );
+
+      assistantMessages.push({
+        id: randomUUID(),
+        variant: "summary",
+        content: result.draft_po.supplier_name
+          ? `Drafted a PO for ${result.draft_po.supplier_name}.`
+          : "Drafted a PO — let's pick the right supplier together.",
+        meta: {
+          reasoning: result.reasoning_summary,
+          needsPriceList: priceRows.length === 0,
+        },
+      });
+
+      if (priceRows.length === 0) {
+        assistantMessages.push({
+          id: randomUUID(),
+          variant: "text",
+          content: "I don't see a price list yet. Tell me the SKU (or description), quantity, and price so I can keep going — I'll save it for next time.",
+        });
+      }
+
+      if (result.questions_for_user.length > 0) {
+        assistantMessages.push({
+          id: randomUUID(),
+          variant: "questions",
+          content: "I need a couple of clarifications to finalise this order.",
+          meta: { questions: result.questions_for_user },
+        });
+      }
+
+      res.json({ assistantMessages, updatedDraft: result });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ error: "Invalid chat payload", details: error.errors });
+      }
+      console.error("Chat route error:", error);
+      res.status(500).json({ error: "Failed to process chat request" });
+    }
+  });
+
   app.post("/api/ai/generate-draft-po", async (req, res) => {
     try {
       const aiRequestSchema = z.object({
@@ -343,11 +638,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const suppliers = await storage.getSuppliers();
       const priceRows = await storage.getPriceListRows();
       const businessRulesArray = await storage.getBusinessRules();
-
-      const businessRules: Record<string, string> = {};
-      businessRulesArray.forEach((rule) => {
-        businessRules[rule.key] = rule.value;
-      });
+      const businessRules = buildBusinessRuleMap(businessRulesArray);
 
       const result = await generateDraftPO(
         userRequest,
@@ -408,11 +699,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const suppliers = await storage.getSuppliers();
       const priceRows = await storage.getPriceListRows();
       const businessRulesArray = await storage.getBusinessRules();
-
-      const businessRules: Record<string, string> = {};
-      businessRulesArray.forEach((rule) => {
-        businessRules[rule.key] = rule.value;
-      });
+      const businessRules = buildBusinessRuleMap(businessRulesArray);
 
       const result = await regeneratePOWithClarifications(
         userRequest,

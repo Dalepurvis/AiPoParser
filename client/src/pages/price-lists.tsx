@@ -3,7 +3,7 @@ import { useQuery, useMutation } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Plus, Package, Trash2, Upload, FileText, X, Check, AlertCircle } from "lucide-react";
+import { Plus, Package, Trash2, Upload, FileText, X, Check, AlertCircle, Edit2, Loader2 } from "lucide-react";
 import type { PriceListRow, InsertPriceListRow, Supplier } from "@shared/schema";
 import {
   Table,
@@ -61,6 +61,7 @@ export default function PriceLists() {
   const [extractedItems, setExtractedItems] = useState<ExtractedItem[]>([]);
   const [isReviewMode, setIsReviewMode] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
+  const [editingRow, setEditingRow] = useState<PriceListRow | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
 
@@ -73,6 +74,21 @@ export default function PriceLists() {
   });
 
   const form = useForm<InsertPriceListRow>({
+    resolver: zodResolver(insertPriceListRowSchema),
+    defaultValues: {
+      supplierId: "",
+      sku: "",
+      productName: "",
+      unitType: "box",
+      minQty: 1,
+      maxQty: null,
+      unitPrice: 0,
+      currency: "GBP",
+      notes: "",
+    },
+  });
+
+  const editForm = useForm<InsertPriceListRow>({
     resolver: zodResolver(insertPriceListRowSchema),
     defaultValues: {
       supplierId: "",
@@ -104,6 +120,29 @@ export default function PriceLists() {
       toast({
         title: "Error",
         description: "Failed to create price list entry.",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const updatePriceRowMutation = useMutation({
+    mutationFn: async ({ id, data }: { id: string; data: InsertPriceListRow }) => {
+      const response = await apiRequest("PUT", `/api/price-lists/${id}`, data);
+      return await response.json() as PriceListRow;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["/api/price-lists"] });
+      toast({
+        title: "Success",
+        description: "Price list entry updated successfully.",
+      });
+      setEditingRow(null);
+      editForm.reset();
+    },
+    onError: () => {
+      toast({
+        title: "Error",
+        description: "Failed to update price list entry.",
         variant: "destructive",
       });
     },
@@ -191,6 +230,11 @@ export default function PriceLists() {
 
   const onSubmit = (data: InsertPriceListRow) => {
     createPriceRowMutation.mutate(data);
+  };
+
+  const handleEditSubmit = (data: InsertPriceListRow) => {
+    if (!editingRow) return;
+    updatePriceRowMutation.mutate({ id: editingRow.id, data });
   };
 
   const resetUploadState = () => {
@@ -297,6 +341,21 @@ export default function PriceLists() {
     return suppliers?.find((s) => s.id === supplierId)?.name || "Unknown";
   };
 
+  const openEditDialog = (row: PriceListRow) => {
+    setEditingRow(row);
+    editForm.reset({
+      supplierId: row.supplierId,
+      sku: row.sku,
+      productName: row.productName,
+      unitType: row.unitType,
+      minQty: row.minQty ?? null,
+      maxQty: row.maxQty ?? null,
+      unitPrice: row.unitPrice,
+      currency: row.currency,
+      notes: row.notes ?? "",
+    });
+  };
+
   const formatFileSize = (bytes: number) => {
     if (bytes === 0) return '0 Bytes';
     const k = 1024;
@@ -306,8 +365,9 @@ export default function PriceLists() {
   };
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between flex-wrap gap-4">
+    <>
+      <div className="space-y-6">
+        <div className="flex items-center justify-between flex-wrap gap-4">
         <div>
           <h1 className="text-3xl font-semibold" data-testid="text-price-lists-title">
             Price Lists
@@ -904,15 +964,25 @@ export default function PriceLists() {
                         {row.notes || "-"}
                       </TableCell>
                       <TableCell className="text-right">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => deletePriceRowMutation.mutate(row.id)}
-                          disabled={deletePriceRowMutation.isPending}
-                          data-testid={`button-delete-${row.id}`}
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </Button>
+                        <div className="flex justify-end gap-1">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => openEditDialog(row)}
+                            data-testid={`button-edit-${row.id}`}
+                          >
+                            <Edit2 className="w-4 h-4" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => deletePriceRowMutation.mutate(row.id)}
+                            disabled={deletePriceRowMutation.isPending}
+                            data-testid={`button-delete-${row.id}`}
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </Button>
+                        </div>
                       </TableCell>
                     </TableRow>
                   ))}
@@ -946,6 +1016,235 @@ export default function PriceLists() {
           )}
         </CardContent>
       </Card>
-    </div>
+      </div>
+
+      <Dialog
+        open={!!editingRow}
+        onOpenChange={(open) => {
+          if (!open) {
+            setEditingRow(null);
+            editForm.reset();
+          }
+        }}
+      >
+        <DialogContent className="max-w-xl" data-testid="dialog-edit-price-row">
+          <DialogHeader>
+            <DialogTitle data-testid="text-edit-price-row-title">Edit Price List Entry</DialogTitle>
+            <DialogDescription data-testid="text-edit-price-row-description">
+              Update pricing or product details and save to keep your price list accurate.
+            </DialogDescription>
+          </DialogHeader>
+
+          <Form {...editForm}>
+            <form onSubmit={editForm.handleSubmit(handleEditSubmit)} className="space-y-4">
+              <FormField
+                control={editForm.control}
+                name="supplierId"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Supplier *</FormLabel>
+                    <Select onValueChange={field.onChange} value={field.value}>
+                      <FormControl>
+                        <SelectTrigger data-testid="select-edit-supplier">
+                          <SelectValue placeholder="Select a supplier" />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent>
+                        {suppliers?.map((supplier) => (
+                          <SelectItem key={supplier.id} value={supplier.id}>
+                            {supplier.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <div className="grid gap-4 md:grid-cols-2">
+                <FormField
+                  control={editForm.control}
+                  name="sku"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>SKU *</FormLabel>
+                      <FormControl>
+                        <Input {...field} data-testid="input-edit-sku" />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={editForm.control}
+                  name="productName"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Product Name *</FormLabel>
+                      <FormControl>
+                        <Input {...field} data-testid="input-edit-product-name" />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-3">
+                <FormField
+                  control={editForm.control}
+                  name="unitType"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Unit Type *</FormLabel>
+                      <Select onValueChange={field.onChange} value={field.value}>
+                        <FormControl>
+                          <SelectTrigger data-testid="select-edit-unit-type">
+                            <SelectValue placeholder="Select" />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
+                          <SelectItem value="box">Box</SelectItem>
+                          <SelectItem value="pallet">Pallet</SelectItem>
+                          <SelectItem value="m2">m²</SelectItem>
+                          <SelectItem value="unit">Unit</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={editForm.control}
+                  name="minQty"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Min Qty</FormLabel>
+                      <FormControl>
+                        <Input
+                          type="number"
+                          value={field.value ?? ""}
+                          onChange={(e) => field.onChange(e.target.value ? parseInt(e.target.value, 10) : null)}
+                          data-testid="input-edit-min-qty"
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={editForm.control}
+                  name="maxQty"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Max Qty</FormLabel>
+                      <FormControl>
+                        <Input
+                          type="number"
+                          value={field.value ?? ""}
+                          onChange={(e) => field.onChange(e.target.value ? parseInt(e.target.value, 10) : null)}
+                          data-testid="input-edit-max-qty"
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-3">
+                <FormField
+                  control={editForm.control}
+                  name="unitPrice"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Unit Price *</FormLabel>
+                      <FormControl>
+                        <Input
+                          type="number"
+                          step="0.01"
+                          value={field.value ?? 0}
+                          onChange={(e) => field.onChange(parseFloat(e.target.value) || 0)}
+                          data-testid="input-edit-unit-price"
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={editForm.control}
+                  name="currency"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Currency *</FormLabel>
+                      <Select onValueChange={field.onChange} value={field.value}>
+                        <FormControl>
+                          <SelectTrigger data-testid="select-edit-currency">
+                            <SelectValue />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
+                          <SelectItem value="GBP">GBP (£)</SelectItem>
+                          <SelectItem value="EUR">EUR (€)</SelectItem>
+                          <SelectItem value="USD">USD ($)</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={editForm.control}
+                  name="notes"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Notes</FormLabel>
+                      <FormControl>
+                        <Input
+                          value={field.value ?? ""}
+                          onChange={field.onChange}
+                          onBlur={field.onBlur}
+                          name={field.name}
+                          ref={field.ref}
+                          data-testid="input-edit-notes"
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setEditingRow(null)}
+                  data-testid="button-cancel-edit-price-row"
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={updatePriceRowMutation.isPending}
+                  data-testid="button-save-edit-price-row"
+                >
+                  {updatePriceRowMutation.isPending ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Saving...
+                    </>
+                  ) : (
+                    "Save Changes"
+                  )}
+                </Button>
+              </DialogFooter>
+            </form>
+          </Form>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 }
